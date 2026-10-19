@@ -1,0 +1,40 @@
+# ── Node.js ────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp
+.pnp.js
+
+# ── Environment variables ───────────────────────
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# ── Vite / Build output ─────────────────────────
+frontend/dist/
+frontend/.vite/
+
+# ── Generated PDFs ──────────────────────────────
+backend/generated-pdfs/
+
+# ── Logs ───────────────────────────────────────
+logs/
+*.log
+
+# ── OS files ───────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDE ────────────────────────────────────────
+.vscode/
+.idea/
+*.iml
+
+# ── AI design images saved from orders ─────────
+backend/design-images/
+
+# ── AI Studio data (users, chats, images) ───────
+backend/data/
