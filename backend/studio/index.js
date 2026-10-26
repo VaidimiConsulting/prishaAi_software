@@ -59,22 +59,47 @@ const JWT_SECRET = getJwtSecret();
 /* ------------------------------------------------------------------ */
 const router = express.Router();
 
+const MAX_UPLOAD_PHOTOS = 4;
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 }, // Support any image size up to 50MB
 });
 
-function uploadSinglePhoto(req, res, next) {
-  upload.single("photo")(req, res, (err) => {
+const photosUpload = upload.fields([
+  { name: "photos", maxCount: 20 },
+  { name: "photo", maxCount: 20 },
+]);
+
+function uploadPhotosMiddleware(req, res, next) {
+  photosUpload(req, res, (err) => {
     if (err) {
       if (err.code === "LIMIT_FILE_SIZE") {
         return res.status(400).json({ error: "Image size is too large (max 50MB allowed)." });
       }
       return res.status(400).json({ error: err.message || "Image upload failed." });
     }
+
+    const files = [];
+    if (req.files) {
+      if (Array.isArray(req.files.photos)) files.push(...req.files.photos);
+      if (Array.isArray(req.files.photo)) files.push(...req.files.photo);
+    }
+    if (req.file && !files.includes(req.file)) {
+      files.push(req.file);
+    }
+
+    if (files.length > MAX_UPLOAD_PHOTOS) {
+      return res.status(400).json({ error: "Maximum 4 photos allowed." });
+    }
+
+    req.uploadedPhotos = files;
+    req.file = files[0] || null;
     next();
   });
 }
+
+const uploadSinglePhoto = uploadPhotosMiddleware;
 
 let openaiClient = null;
 function getClient() {
@@ -282,8 +307,8 @@ router.put("/chats/:id", identify, (req, res) => {
   if (typeof req.body.title === "string" && req.body.title.trim()) chat.title = req.body.title.trim().slice(0, 80);
   if (Array.isArray(req.body.messages)) {
     chat.messages = req.body.messages.slice(-200);
-    const firstPhoto = chat.messages.find((m) => m.role === "user" && m.photoUrl);
-    chat.thumb = firstPhoto ? firstPhoto.photoUrl : "";
+    const firstPhoto = chat.messages.find((m) => m.role === "user" && (m.photoUrl || (Array.isArray(m.photoUrls) && m.photoUrls[0])));
+    chat.thumb = firstPhoto ? (firstPhoto.photoUrl || firstPhoto.photoUrls[0]) : "";
   }
   chat.updatedAt = Date.now();
   saveDb();
@@ -414,9 +439,14 @@ async function callImageApi(client, { photo, prompt, size, quality, transparent 
   }
 }
 
-router.post("/generate", identify, uploadSinglePhoto, async (req, res) => {
+router.post("/generate", identify, uploadPhotosMiddleware, async (req, res) => {
   const userPrompt = String(req.body.prompt || "").trim();
   if (!userPrompt) return res.status(400).json({ error: "Please write what you want." });
+
+  const uploadedFiles = req.uploadedPhotos || (req.file ? [req.file] : []);
+  if (uploadedFiles.length > MAX_UPLOAD_PHOTOS) {
+    return res.status(400).json({ error: "Maximum 4 photos allowed." });
+  }
 
   let client;
   try {
@@ -432,21 +462,22 @@ router.post("/generate", identify, uploadSinglePhoto, async (req, res) => {
 
   const quality = QUALITIES.includes(req.body.quality) ? req.body.quality : DEFAULT_QUALITY;
   const transparent = wantsBgRemoval(userPrompt);
-  const hasPhoto = Boolean(req.file);
+  const hasPhoto = uploadedFiles.length > 0;
   const prompt = buildPrompt(userPrompt, hasPhoto, transparent);
   const size = pickSize(req.body.aspect);
 
-  // Optimize uploaded photo regardless of original dimensions or file size
-  let photo = null;
-  let photoUrl = "";
-  if (hasPhoto) {
-    let buf = req.file.buffer;
-    let mime = req.file.mimetype || "image/jpeg";
+  // Optimize uploaded photo(s) regardless of original dimensions or file size
+  const photos = [];
+  const photoUrls = [];
+
+  for (const file of uploadedFiles) {
+    let buf = file.buffer;
+    let mime = file.mimetype || "image/jpeg";
     try {
       // Auto-orient according to EXIF and resize within 1024x1024 progressive JPEG
       // Ensures that any uploaded image (5MB, 20MB, 40MB) takes only ~30ms to normalize
       // and OpenAI receives a lightweight payload for lightning-fast 7-8s generation.
-      buf = await sharp(req.file.buffer)
+      buf = await sharp(file.buffer)
         .rotate()
         .resize({ width: 1024, height: 1024, fit: "inside", withoutEnlargement: true })
         .jpeg({ quality: 82, progressive: true })
@@ -456,11 +487,13 @@ router.post("/generate", identify, uploadSinglePhoto, async (req, res) => {
       console.warn("Sharp optimization fallback:", sharpErr.message);
     }
 
-    photo = { buffer: buf, name: "room.jpg", mime };
     const f = `in_${crypto.randomUUID()}.jpg`;
     await fs.promises.writeFile(path.join(IMG_DIR, f), buf);
-    photoUrl = `/files/${f}`;
+    photoUrls.push(`/files/${f}`);
+    photos.push({ buffer: buf, name: file.originalname || "room.jpg", mime });
   }
+
+  const photoUrl = photoUrls[0] || "";
 
   // Stream results one-by-one so the first image appears as soon as it is ready
   res.writeHead(200, {
@@ -477,11 +510,12 @@ router.post("/generate", identify, uploadSinglePhoto, async (req, res) => {
     if (!finished) controller.abort(); // user left -> stop spending money
   });
 
-  send({ type: "meta", count, photoUrl, transparent, size, quality });
+  send({ type: "meta", count, photoUrl, photoUrls, transparent, size, quality });
 
   await Promise.all(
     Array.from({ length: count }, async (_, index) => {
       try {
+        const photo = photos.length > 0 ? photos[index % photos.length] : null;
         const r = await callImageApi(client, { photo, prompt, size, quality, transparent }, controller.signal);
         const b64 = r.data && r.data[0] && r.data[0].b64_json;
         if (!b64) throw new Error("No image returned.");

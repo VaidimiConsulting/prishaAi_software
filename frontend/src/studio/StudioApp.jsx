@@ -24,6 +24,7 @@ const QUALITY = [
   { id: "medium", label: "Balanced", icon: Gauge },
   { id: "high", label: "Best", icon: Sparkles },
 ];
+const MAX_PHOTOS = 4;
 const isMobile = () => window.matchMedia("(max-width: 899px)").matches;
 
 const loadPrefs = () => {
@@ -74,7 +75,7 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [renaming, setRenaming] = useState(null); // {id, value}
-  const [pending, setPending] = useState(null);
+  const [pending, setPending] = useState([]);
   const [input, setInput] = useState("");
   const [generating, setGenerating] = useState(null);
   const [error, setError] = useState("");
@@ -188,43 +189,100 @@ export default function App() {
   }
 
   /* ---------- photo handling ---------- */
-  async function handlePhotoFile(file) {
-    if (!file || !file.type.startsWith("image/")) return;
+  async function handlePhotoFiles(files) {
+    if (!files) return;
+    const list = Array.from(files).filter((f) => f && f.type?.startsWith("image/"));
+    if (list.length === 0) return;
     setAddMenu(false);
     setError("");
-    const { file: f, aspect } = await prepareImage(file);
+
+    if (pending.length >= MAX_PHOTOS) {
+      showToast("Maximum 4 photos allowed");
+      if (fileRef.current) fileRef.current.value = "";
+      return;
+    }
+
+    const availableSlots = MAX_PHOTOS - pending.length;
+    const acceptedFiles = list.slice(0, availableSlots);
+    const hasExcess = list.length > availableSlots;
+
+    const preparedList = await Promise.all(
+      acceptedFiles.map(async (file) => {
+        const { file: f, aspect } = await prepareImage(file);
+        const resolved = f || file;
+        return {
+          id: crypto.randomUUID(),
+          file: resolved,
+          aspect: aspect || 1,
+          preview: URL.createObjectURL(resolved),
+        };
+      })
+    );
+
     setPending((old) => {
-      if (old?.preview) URL.revokeObjectURL(old.preview);
-      return { file: f, aspect, preview: URL.createObjectURL(f) };
+      const slotsLeft = MAX_PHOTOS - old.length;
+      if (slotsLeft <= 0) {
+        preparedList.forEach((p) => URL.revokeObjectURL(p.preview));
+        return old;
+      }
+      const toAdd = preparedList.slice(0, slotsLeft);
+      preparedList.slice(slotsLeft).forEach((p) => URL.revokeObjectURL(p.preview));
+      return [...old, ...toAdd];
     });
+
+    if (fileRef.current) fileRef.current.value = "";
+
+    if (hasExcess) {
+      showToast("Maximum 4 photos allowed");
+    }
   }
-  function clearPending() {
+
+  function removePhoto(index) {
     setPending((old) => {
-      if (old?.preview) URL.revokeObjectURL(old.preview);
-      return null;
+      const target = old[index];
+      if (target?.preview) {
+        URL.revokeObjectURL(target.preview);
+      }
+      return old.filter((_, i) => i !== index);
     });
     if (fileRef.current) fileRef.current.value = "";
   }
+
+  function clearPending() {
+    setPending((old) => {
+      old.forEach((p) => {
+        if (p?.preview) URL.revokeObjectURL(p.preview);
+      });
+      return [];
+    });
+    if (fileRef.current) fileRef.current.value = "";
+  }
+
   function onPaste(e) {
-    const item = [...(e.clipboardData?.items || [])].find((i) => i.type.startsWith("image/"));
-    if (item) {
+    const items = [...(e.clipboardData?.items || [])];
+    const imgFiles = items
+      .filter((i) => i.type && i.type.startsWith("image/"))
+      .map((i) => i.getAsFile())
+      .filter(Boolean);
+    if (imgFiles.length > 0) {
       e.preventDefault();
-      handlePhotoFile(item.getAsFile());
+      handlePhotoFiles(imgFiles);
     }
   }
+
   function onDrop(e) {
     e.preventDefault();
     setDragOver(false);
-    const f = e.dataTransfer?.files?.[0];
-    if (f) handlePhotoFile(f);
+    const files = [...(e.dataTransfer?.files || [])].filter((f) => f && f.type?.startsWith("image/"));
+    if (files.length > 0) handlePhotoFiles(files);
   }
 
   const fetchBlob = async (url) => (await fetch(absUrl(url))).blob();
 
-  async function useAsInput(url) {
+  async function handleUseAsInput(url) {
     try {
       const blob = await fetchBlob(url);
-      await handlePhotoFile(new File([blob], "previous-result." + (blob.type.includes("png") ? "png" : "jpg"), { type: blob.type }));
+      await handlePhotoFiles([new File([blob], "previous-result." + (blob.type.includes("png") ? "png" : "jpg"), { type: blob.type })]);
       setLightbox(null);
       taRef.current?.focus();
       showToast("Image input me add ho gayi — ab likho kya badalna hai");
@@ -332,7 +390,7 @@ export default function App() {
   }
 
   /* ---------- generate ---------- */
-  async function runGenerate(prompt, photo) {
+  async function runGenerate(prompt, photos) {
     if (generating) return;
     setError("");
     setSelected(null);
@@ -351,8 +409,20 @@ export default function App() {
       }
     }
 
-    const userMsg = { role: "user", text: prompt, photoUrl: photo?.preview || "" };
-    const asstMsg = { role: "assistant", items: null, aspect: photo ? Math.round(photo.aspect * 100) / 100 : 1 };
+    const photoList = Array.isArray(photos) ? photos : (photos ? [photos] : []);
+    const firstPreview = photoList[0]?.preview || "";
+    const previewUrls = photoList.map((p) => p.preview);
+    const userMsg = {
+      role: "user",
+      text: prompt,
+      photoUrl: firstPreview,
+      photoUrls: previewUrls,
+    };
+    const asstMsg = {
+      role: "assistant",
+      items: null,
+      aspect: photoList[0]?.aspect ? Math.round(photoList[0].aspect * 100) / 100 : 1,
+    };
     let msgs = [...messages, userMsg, asstMsg];
     const asstIdx = msgs.length - 1;
     const userIdx = asstIdx - 1;
@@ -368,20 +438,20 @@ export default function App() {
     abortRef.current = controller;
 
     const form = new FormData();
-    if (photo && photo.file) {
-      let sendFile = photo.file;
-      let sendAspect = photo.aspect || 1;
-      if (sendFile.size > 600 * 1024) {
-        try {
-          const prep = await prepareImage(sendFile);
-          if (prep.file) {
-            sendFile = prep.file;
-            sendAspect = prep.aspect;
+    if (photoList.length > 0) {
+      for (const p of photoList) {
+        if (p && p.file) {
+          let sendFile = p.file;
+          if (sendFile.size > 600 * 1024) {
+            try {
+              const prep = await prepareImage(sendFile);
+              if (prep.file) sendFile = prep.file;
+            } catch { /* proceed */ }
           }
-        } catch { /* proceed */ }
+          form.append("photos", sendFile);
+        }
       }
-      form.append("photo", sendFile);
-      form.append("aspect", String(sendAspect));
+      form.append("aspect", String(photoList[0]?.aspect || 1));
     }
     form.append("prompt", prompt);
     form.append("count", String(prefs.count || 1));
@@ -392,7 +462,16 @@ export default function App() {
         form,
         (ev) => {
           if (ev.type === "meta") {
-            msgs = msgs.map((m, i) => (i === userIdx && ev.photoUrl ? { ...m, photoUrl: ev.photoUrl } : m));
+            const serverUrls = ev.photoUrls || (ev.photoUrl ? [ev.photoUrl] : []);
+            msgs = msgs.map((m, i) =>
+              i === userIdx
+                ? {
+                    ...m,
+                    photoUrl: ev.photoUrl || m.photoUrl,
+                    photoUrls: serverUrls.length > 0 ? serverUrls : m.photoUrls,
+                  }
+                : m
+            );
             patchAsst((m) => ({ ...m, items: Array(ev.count).fill(null), transparent: ev.transparent }));
           } else if (ev.type === "image") {
             patchAsst((m) => ({ ...m, items: m.items.map((it, i) => (i === ev.index ? ev.url : it)) }));
@@ -406,10 +485,19 @@ export default function App() {
       const stopped = err.name === "AbortError";
       patchAsst((m) => ({ ...m, items: (m.items || [null]).map((it) => it || { error: stopped ? "Stopped" : err.message }) }));
     } finally {
+      photoList.forEach((p) => {
+        if (p?.preview && p.preview.startsWith("blob:")) {
+          URL.revokeObjectURL(p.preview);
+        }
+      });
       patchAsst((m) => ({ ...m, items: (m.items || [null]).map((it) => it || { error: "No result" }) }));
       setGenerating(null);
       abortRef.current = null;
-      const clean = msgs.map((m) => (m.photoUrl?.startsWith("blob:") ? { ...m, photoUrl: "" } : m));
+      const clean = msgs.map((m) => ({
+        ...m,
+        photoUrl: m.photoUrl?.startsWith("blob:") ? "" : m.photoUrl,
+        photoUrls: Array.isArray(m.photoUrls) ? m.photoUrls.filter((u) => !u.startsWith("blob:")) : m.photoUrls,
+      }));
       api(`/api/studio/chats/${chatId}`, { method: "PUT", body: { messages: clean } }).then(loadChats).catch(() => {});
     }
   }
@@ -417,26 +505,32 @@ export default function App() {
   function handleSend() {
     const prompt = input.trim();
     if (!prompt) return setError("Pehle likhein ki aapko kya chahiye.");
-    const photo = pending;
+    const photosToSend = pending;
     setInput("");
-    setPending(null);
-    runGenerate(prompt, photo);
+    setPending([]);
+    if (fileRef.current) fileRef.current.value = "";
+    runGenerate(prompt, photosToSend);
   }
 
   async function regenerate(asstIndex) {
     const u = messages[asstIndex - 1];
     if (!u || u.role !== "user") return;
-    let photo = null;
-    if (u.photoUrl) {
+    const urls = Array.isArray(u.photoUrls) && u.photoUrls.length > 0 ? u.photoUrls : (u.photoUrl ? [u.photoUrl] : []);
+    let photos = [];
+    if (urls.length > 0) {
       try {
-        const blob = await fetchBlob(u.photoUrl);
-        const f = new File([blob], "photo." + (blob.type.includes("png") ? "png" : "jpg"), { type: blob.type });
-        photo = { file: f, aspect: messages[asstIndex].aspect || 1, preview: u.photoUrl };
+        photos = await Promise.all(
+          urls.map(async (url, idx) => {
+            const blob = await fetchBlob(url);
+            const f = new File([blob], `photo-${idx + 1}.${blob.type.includes("png") ? "png" : "jpg"}`, { type: blob.type });
+            return { id: crypto.randomUUID(), file: f, aspect: messages[asstIndex].aspect || 1, preview: url };
+          })
+        );
       } catch {
         return showToast("Original photo load nahi hui");
       }
     }
-    runGenerate(u.text, photo);
+    runGenerate(u.text, photos);
   }
 
   function reusePrompt(m) {
@@ -590,7 +684,26 @@ export default function App() {
               m.role === "user" ? (
                 <div className="row user" key={i}>
                   <div className="bubble user-b">
-                    {m.photoUrl && <img src={absUrl(m.photoUrl)} alt="Uploaded" className="u-photo" onClick={() => setLightbox({ url: m.photoUrl, name: "original" })} />}
+                    {Array.isArray(m.photoUrls) && m.photoUrls.length > 1 ? (
+                      <div className="u-photos-grid">
+                        {m.photoUrls.map((url, pIdx) => (
+                          <img
+                            key={pIdx}
+                            src={absUrl(url)}
+                            alt={`Uploaded ${pIdx + 1}`}
+                            className="u-photo"
+                            onClick={() => setLightbox({ url, name: `original-${pIdx + 1}` })}
+                          />
+                        ))}
+                      </div>
+                    ) : (m.photoUrl || (Array.isArray(m.photoUrls) && m.photoUrls[0])) ? (
+                      <img
+                        src={absUrl(m.photoUrl || m.photoUrls[0])}
+                        alt="Uploaded"
+                        className="u-photo"
+                        onClick={() => setLightbox({ url: m.photoUrl || m.photoUrls[0], name: "original" })}
+                      />
+                    ) : null}
                     <p>{m.text}</p>
                     <button className="mini-act" onClick={() => reusePrompt(m)} title="Prompt dobara use karein"><CornerUpLeft size={13} /> Reuse</button>
                   </div>
@@ -604,7 +717,11 @@ export default function App() {
                       <>
                         <div className={`grid n${Math.min(m.items.length, 4)}`}>
                           {m.items.map((it, idx) => {
-                            const before = messages[i - 1]?.photoUrl || "";
+                            const prevUser = messages[i - 1];
+                            const prevPhotos = Array.isArray(prevUser?.photoUrls) && prevUser.photoUrls.length > 0
+                              ? prevUser.photoUrls
+                              : (prevUser?.photoUrl ? [prevUser.photoUrl] : []);
+                            const before = prevPhotos.length > 0 ? prevPhotos[idx % prevPhotos.length] : "";
                             const name = `prisha-${i}-${idx + 1}`;
                             return it === null ? (
                               <Skeleton key={idx} aspect={m.aspect || 1} />
@@ -623,7 +740,7 @@ export default function App() {
                                 )}
                                 <div className="tile-actions">
                                   <button onClick={() => setLightbox({ url: it, name, before, mode: "single", transparent: m.transparent })} title="Full view"><Maximize2 size={14} /></button>
-                                  <button onClick={() => useAsInput(it)} title="Is image ko edit karein"><Pencil size={14} /></button>
+                                  <button onClick={() => handleUseAsInput(it)} title="Is image ko edit karein"><Pencil size={14} /></button>
                                   <button onClick={() => downloadImage(it, `${name}.${m.transparent ? "png" : "jpg"}`)} title="Download"><Download size={14} /></button>
                                 </div>
                                 {m.items.length > 1 && <span className="tile-tag">#{idx + 1}</span>}
@@ -667,10 +784,37 @@ export default function App() {
             </div>
 
             <div className="composer">
-              {pending && (
-                <div className="pending">
-                  <img src={pending.preview} alt="Selected" />
-                  <button onClick={clearPending} aria-label="Remove photo"><X size={13} /></button>
+              {pending.length > 0 && (
+                <div className="pending-strip">
+                  <div className="pending-thumbs">
+                    {pending.map((p, idx) => (
+                      <div key={p.id || idx} className="pending-thumb">
+                        <img src={p.preview} alt={`Selected ${idx + 1}`} />
+                        <button
+                          type="button"
+                          onClick={() => removePhoto(idx)}
+                          aria-label={`Remove photo ${idx + 1}`}
+                          title="Remove photo"
+                        >
+                          <X size={13} />
+                        </button>
+                      </div>
+                    ))}
+                    {pending.length < MAX_PHOTOS && (
+                      <button
+                        type="button"
+                        className="pending-add-btn"
+                        onClick={() => fileRef.current?.click()}
+                        aria-label="Add photo"
+                        title="Add another photo"
+                      >
+                        <Plus size={20} />
+                      </button>
+                    )}
+                  </div>
+                  <span className="pending-count-badge" title="Selected photos count">
+                    {pending.length}/{MAX_PHOTOS}
+                  </span>
                 </div>
               )}
 
@@ -678,7 +822,7 @@ export default function App() {
                 ref={taRef}
                 rows={1}
                 value={input}
-                placeholder={pending ? "Kya badalna hai? (remove background / wall green / 3 images)" : "Photo add karein ya seedha describe karein…"}
+                placeholder={pending.length > 0 ? "Kya badalna hai? (remove background / wall green / 3 images)" : "Photo add karein ya seedha describe karein…"}
                 onChange={(e) => setInput(e.target.value)}
                 onPaste={onPaste}
                 onKeyDown={(e) => {
@@ -694,13 +838,56 @@ export default function App() {
                   <div className="plus-wrap">
                     {addMenu && (
                       <div className="add-menu">
-                        <button onClick={() => { setAddMenu(false); setModal("camera"); }}><Camera size={16} /> Camera se photo</button>
-                        <button onClick={() => { setAddMenu(false); fileRef.current?.click(); }}><ImageIcon size={16} /> Gallery / File</button>
+                        <button
+                          onClick={() => {
+                            setAddMenu(false);
+                            if (pending.length >= MAX_PHOTOS) {
+                              showToast("Maximum 4 photos allowed");
+                            } else {
+                              setModal("camera");
+                            }
+                          }}
+                        >
+                          <Camera size={16} /> Camera se photo
+                        </button>
+                        <button
+                          onClick={() => {
+                            setAddMenu(false);
+                            if (pending.length >= MAX_PHOTOS) {
+                              showToast("Maximum 4 photos allowed");
+                            } else {
+                              fileRef.current?.click();
+                            }
+                          }}
+                        >
+                          <ImageIcon size={16} /> Gallery / File
+                        </button>
                       </div>
                     )}
-                    <button className="round-btn" onClick={() => setAddMenu((v) => !v)} aria-label="Add photo"><Plus size={19} /></button>
+                    <button
+                      className="round-btn"
+                      onClick={() => {
+                        if (pending.length >= MAX_PHOTOS) {
+                          showToast("Maximum 4 photos allowed");
+                        } else {
+                          setAddMenu((v) => !v);
+                        }
+                      }}
+                      disabled={pending.length >= MAX_PHOTOS}
+                      aria-label="Add photo"
+                      title={pending.length >= MAX_PHOTOS ? "Maximum 4 photos allowed" : "Add photo"}
+                    >
+                      <Plus size={19} />
+                    </button>
                   </div>
-                  <input ref={fileRef} type="file" accept="image/*" hidden onChange={(e) => handlePhotoFile(e.target.files?.[0])} />
+                  <input
+                    ref={fileRef}
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    hidden
+                    onChange={(e) => handlePhotoFiles(e.target.files)}
+                  />
 
                   <div className="stepper" title="Kitni images chahiye (prompt me likhoge to wahi use hoga)">
                     <button onClick={() => setPrefs({ ...prefs, count: Math.max(1, (prefs.count || 1) - 1) })} aria-label="Fewer"><Minus size={14} /></button>
@@ -750,7 +937,7 @@ export default function App() {
             {lightbox.name !== "original" && (
               <button className="lb-price" onClick={() => openCalculator(lightbox.url)}><IndianRupee size={15} /> Get price estimate</button>
             )}
-            {lightbox.name !== "original" && <button className="icon-btn" onClick={() => useAsInput(lightbox.url)} title="Edit this"><Pencil size={19} /></button>}
+            {lightbox.name !== "original" && <button className="icon-btn" onClick={() => handleUseAsInput(lightbox.url)} title="Edit this"><Pencil size={19} /></button>}
             {navigator.share && <button className="icon-btn" onClick={() => shareImage(lightbox.url)} title="Share"><Share2 size={19} /></button>}
             <button className="icon-btn" onClick={() => downloadImage(lightbox.url, lightbox.name + (lightbox.url.endsWith(".png") ? ".png" : ".jpg"))} title="Download"><Download size={19} /></button>
             <button className="icon-btn" onClick={() => setLightbox(null)} title="Close"><X size={22} /></button>
@@ -765,7 +952,7 @@ export default function App() {
         </div>
       )}
 
-      {modal === "camera" && <CameraModal onClose={() => setModal(null)} onCapture={(f) => { handlePhotoFile(f); setModal(null); }} />}
+      {modal === "camera" && <CameraModal onClose={() => setModal(null)} onCapture={(f) => { handlePhotoFiles([f]); setModal(null); }} />}
       {modal === "auth" && <AuthModal googleClientId={config.googleClientId} onClose={() => setModal(null)} onAuthed={onAuthed} />}
       {modal === "settings" && (
         <SettingsModal
