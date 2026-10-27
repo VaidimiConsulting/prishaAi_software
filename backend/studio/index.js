@@ -1,3 +1,8 @@
+const dns = require("dns");
+if (dns.setDefaultResultOrder) {
+  dns.setDefaultResultOrder("ipv4first");
+}
+
 const express = require("express");
 const multer = require("multer");
 const OpenAI = require("openai");
@@ -116,6 +121,24 @@ function getClient() {
   return openaiClient;
 }
 
+let isWarmedUp = false;
+async function warmupOpenAI() {
+  if (isWarmedUp || !process.env.OPENAI_API_KEY) return;
+  try {
+    const client = getClient();
+    // Warm up DNS, TCP and TLS connection to OpenAI in background
+    await client.models.list().catch(() => {});
+    isWarmedUp = true;
+  } catch {
+    // Ignore background warmup errors
+  }
+}
+
+// Background warm up on server/module load so 1st prompt is just as fast as 2nd prompt
+setTimeout(() => {
+  warmupOpenAI();
+}, 200);
+
 // very small in-memory rate limiter for login/register
 const attempts = new Map();
 function authLimiter(req, res, next) {
@@ -172,6 +195,7 @@ function requireUser(req, res, next) {
 /* Basic routes                                                        */
 /* ------------------------------------------------------------------ */
 router.get("/config", (req, res) => {
+  warmupOpenAI(); // Pre-warm connection when user opens Studio page
   res.json({
     googleClientId: GOOGLE_CLIENT_ID,
     maxImages: MAX_IMAGES,
@@ -334,15 +358,26 @@ const NUM_WORDS = {
   ek: 1, one: 1, do: 2, two: 2, teen: 3, three: 3, char: 4, chaar: 4, four: 4,
   paanch: 5, panch: 5, five: 5, chhe: 6, che: 6, chah: 6, six: 6, saat: 7, seven: 7, aath: 8, eight: 8,
 };
+const ONLY_RE = new RegExp(
+  `\\b(?:sirf|only|just)\\s+(\\d{1,2}|${Object.keys(NUM_WORDS).join("|")})\\b`,
+  "i"
+);
 const COUNT_RE = new RegExp(
   `\\b(\\d{1,2}|${Object.keys(NUM_WORDS).join("|")})\\s*(?:x\\s*)?` +
-    `(?:images?|imgs?|photos?|pics?|pictures?|designs?|options?|variations?|variants?|results?|versions?|outputs?|tasveer(?:ein|en)?|foto)\\b`,
+    `(?:images?|imgs?|photos?|pics?|pictures?|designs?|options?|variations?|variants?|results?|versions?|outputs?|tasveer(?:ein|en)?|foto|pieces?)\\b`,
   "i"
 );
 
-// "give me 3 images" / "do image" / "5 designs" -> count. null if user didn't say.
+// "give me 3 images" / "do image" / "5 designs" / "sirf 1" -> count. null if user didn't say.
 function parseCount(text) {
-  const m = COUNT_RE.exec(text || "");
+  if (!text) return null;
+  const onlyM = ONLY_RE.exec(text);
+  if (onlyM) {
+    const raw = onlyM[1].toLowerCase();
+    const n = /^\d+$/.test(raw) ? parseInt(raw, 10) : NUM_WORDS[raw];
+    if (n >= 1) return n;
+  }
+  const m = COUNT_RE.exec(text);
   if (!m) return null;
   const raw = m[1].toLowerCase();
   const n = /^\d+$/.test(raw) ? parseInt(raw, 10) : NUM_WORDS[raw];
@@ -396,6 +431,21 @@ function extFromMime(m) {
   return "jpg";
 }
 
+const INPUT_FIDELITY = process.env.INPUT_FIDELITY || "low";
+const IMAGE_TIMEOUT_SEC = Math.max(10, parseInt(process.env.IMAGE_TIMEOUT_SEC || "300", 10));
+
+// In-memory jobs storage (cleaned up after 30 minutes)
+const jobs = new Map();
+const JOB_LIFETIME_MS = 30 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, job] of jobs.entries()) {
+    if (now - job.createdAt > JOB_LIFETIME_MS) {
+      jobs.delete(id);
+    }
+  }
+}, 60 * 1000);
+
 async function callImageApi(client, { photo, prompt, size, quality, transparent }, signal) {
   const base = {
     model: IMAGE_MODEL,
@@ -414,14 +464,19 @@ async function callImageApi(client, { photo, prompt, size, quality, transparent 
   const run = async (extra) => {
     if (photo) {
       const image = await toFile(photo.buffer, photo.name, { type: photo.mime });
-      return client.images.edit({ ...base, ...extra, image }, { signal });
+      return client.images.edit(
+        { ...base, ...extra, image },
+        { signal, timeout: IMAGE_TIMEOUT_SEC * 1000 }
+      );
     }
-    return client.images.generate({ ...base, ...extra }, { signal });
+    return client.images.generate(
+      { ...base, ...extra },
+      { signal, timeout: IMAGE_TIMEOUT_SEC * 1000 }
+    );
   };
 
   try {
-    // Only pass input_fidelity if model is legacy gpt-image-1 (not supported by gpt-image-1-mini)
-    const extra = photo && IMAGE_MODEL === "gpt-image-1" ? { input_fidelity: "high" } : {};
+    const extra = photo && IMAGE_MODEL === "gpt-image-1" ? { input_fidelity: INPUT_FIDELITY } : {};
     return await run(extra);
   } catch (err) {
     const msg = String(err && err.message);
@@ -431,9 +486,15 @@ async function callImageApi(client, { photo, prompt, size, quality, transparent 
       delete minimal.input_fidelity;
       if (photo) {
         const image = await toFile(photo.buffer, photo.name, { type: photo.mime });
-        return client.images.edit({ ...minimal, image }, { signal });
+        return client.images.edit(
+          { ...minimal, image },
+          { signal, timeout: IMAGE_TIMEOUT_SEC * 1000 }
+        );
       }
-      return client.images.generate(minimal, { signal });
+      return client.images.generate(
+        minimal,
+        { signal, timeout: IMAGE_TIMEOUT_SEC * 1000 }
+      );
     }
     throw err;
   }
@@ -455,14 +516,29 @@ router.post("/generate", identify, uploadPhotosMiddleware, async (req, res) => {
     return res.status(500).json({ error: e.message });
   }
 
+  const photoCount = uploadedFiles.length;
   // How many images? Prompt wins ("3 images"), then the UI selector, else 1.
   let count = parseCount(userPrompt);
   if (count === null) count = parseInt(req.body.count, 10) || 1;
-  count = Math.min(Math.max(count, 1), MAX_IMAGES);
+  count = Math.max(1, count);
+
+  let perPhoto = count;
+  let total = photoCount > 0 ? photoCount * perPhoto : perPhoto;
+  let limited = false;
+  if (total > MAX_IMAGES) {
+    limited = true;
+    if (photoCount > 0) {
+      perPhoto = Math.max(1, Math.floor(MAX_IMAGES / photoCount));
+      total = photoCount * perPhoto;
+    } else {
+      perPhoto = MAX_IMAGES;
+      total = MAX_IMAGES;
+    }
+  }
 
   const quality = QUALITIES.includes(req.body.quality) ? req.body.quality : DEFAULT_QUALITY;
   const transparent = wantsBgRemoval(userPrompt);
-  const hasPhoto = uploadedFiles.length > 0;
+  const hasPhoto = photoCount > 0;
   const prompt = buildPrompt(userPrompt, hasPhoto, transparent);
   const size = pickSize(req.body.aspect);
 
@@ -474,9 +550,6 @@ router.post("/generate", identify, uploadPhotosMiddleware, async (req, res) => {
     let buf = file.buffer;
     let mime = file.mimetype || "image/jpeg";
     try {
-      // Auto-orient according to EXIF and resize within 1024x1024 progressive JPEG
-      // Ensures that any uploaded image (5MB, 20MB, 40MB) takes only ~30ms to normalize
-      // and OpenAI receives a lightweight payload for lightning-fast 7-8s generation.
       buf = await sharp(file.buffer)
         .rotate()
         .resize({ width: 1024, height: 1024, fit: "inside", withoutEnlargement: true })
@@ -494,45 +567,103 @@ router.post("/generate", identify, uploadPhotosMiddleware, async (req, res) => {
   }
 
   const photoUrl = photoUrls[0] || "";
-
-  // Stream results one-by-one so the first image appears as soon as it is ready
-  res.writeHead(200, {
-    "Content-Type": "application/x-ndjson; charset=utf-8",
-    "Cache-Control": "no-cache, no-transform",
-    "X-Accel-Buffering": "no",
-  });
-  res.flushHeaders?.();
-  const send = (obj) => !res.writableEnded && res.write(JSON.stringify(obj) + "\n");
-
+  const jobId = crypto.randomUUID();
   const controller = new AbortController();
-  let finished = false;
-  res.on("close", () => {
-    if (!finished) controller.abort(); // user left -> stop spending money
+
+  const results = Array.from({ length: total }, (_, i) => ({
+    status: "pending",
+    photoIndex: photoCount > 0 ? Math.floor(i / perPhoto) : 0,
+  }));
+
+  const job = {
+    id: jobId,
+    ownerId: req.owner.id,
+    total,
+    perPhoto,
+    photoCount,
+    photoUrls,
+    transparent,
+    limited,
+    results,
+    done: false,
+    controller,
+    createdAt: Date.now(),
+  };
+
+  jobs.set(jobId, job);
+
+  // Respond immediately with JSON (avoids Hostinger 120s timeout)
+  res.json({
+    jobId,
+    count: total,
+    perPhoto,
+    photoCount,
+    photoUrls,
+    photoUrl,
+    transparent,
+    limited,
   });
 
-  send({ type: "meta", count, photoUrl, photoUrls, transparent, size, quality });
+  // Run OpenAI calls in background
+  const t0 = Date.now();
+  console.log(`[Studio] Starting background job ${jobId} for ${total} image(s) (${photoCount} photo(s) x ${perPhoto} per photo)...`);
 
-  await Promise.all(
-    Array.from({ length: count }, async (_, index) => {
+  Promise.all(
+    Array.from({ length: total }, async (_, index) => {
+      const photoIndex = photoCount > 0 ? Math.floor(index / perPhoto) : 0;
+      const photo = photos.length > 0 ? photos[photoIndex] : null;
+      const itemT0 = Date.now();
       try {
-        const photo = photos.length > 0 ? photos[index % photos.length] : null;
-        const r = await callImageApi(client, { photo, prompt, size, quality, transparent }, controller.signal);
+        const r = await callImageApi(
+          client,
+          { photo, prompt, size, quality, transparent },
+          controller.signal
+        );
         const b64 = r.data && r.data[0] && r.data[0].b64_json;
         if (!b64) throw new Error("No image returned.");
         const f = `out_${crypto.randomUUID()}.${transparent ? "png" : "jpg"}`;
         await fs.promises.writeFile(path.join(IMG_DIR, f), Buffer.from(b64, "base64"));
-        send({ type: "image", index, url: `/files/${f}` });
+        job.results[index] = {
+          status: "done",
+          photoIndex,
+          url: `/files/${f}`,
+        };
+        console.log(`[Studio] Job ${jobId} item #${index + 1} done in ${((Date.now() - itemT0) / 1000).toFixed(1)}s`);
       } catch (err) {
-        if (controller.signal.aborted) return;
-        console.error(`Generation error (#${index + 1}):`, err.message);
-        send({ type: "error", index, message: err.message || "Generation failed." });
+        const msg = controller.signal.aborted ? "Stopped" : (err.message || "Generation failed.");
+        job.results[index] = {
+          status: "error",
+          photoIndex,
+          message: msg,
+        };
+        console.error(`[Studio] Job ${jobId} item #${index + 1} error:`, err.message);
       }
     })
-  );
+  ).finally(() => {
+    job.done = true;
+    console.log(`[Studio] Job ${jobId} finished in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  });
+});
 
-  finished = true;
-  send({ type: "done" });
-  res.end();
+router.get("/jobs/:id", identify, (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job || job.ownerId !== req.owner.id) {
+    return res.status(404).json({ error: "Job not found." });
+  }
+  res.json({ done: job.done, results: job.results });
+});
+
+router.post("/jobs/:id/cancel", identify, (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job || job.ownerId !== req.owner.id) {
+    return res.status(404).json({ error: "Job not found." });
+  }
+  job.controller.abort();
+  job.results = job.results.map((r) =>
+    r.status === "pending" ? { ...r, status: "error", message: "Stopped" } : r
+  );
+  job.done = true;
+  res.json({ ok: true });
 });
 
 module.exports = router;

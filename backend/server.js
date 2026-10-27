@@ -11,6 +11,7 @@
  * PRODUCTION: npm run build -> npm start -> http://localhost:3001
  */
 
+require('dns').setDefaultResultOrder('ipv4first');
 require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 const express = require('express');
 const cors    = require('cors');
@@ -79,6 +80,14 @@ app.listen(PORT, () => {
   console.log(`   AI Studio  : ${base}/studio/`);
   console.log(`   Admin      : ${base}/admin`);
   console.log(`   Admin login: ${process.env.ADMIN_USER || 'admin'} / ${process.env.ADMIN_PASS || 'admin@123'}`);
-  if (!process.env.OPENAI_API_KEY) console.log('   ⚠️  OPENAI_API_KEY .env me nahi hai — AI Studio image nahi bana payega.');
+  if (!process.env.OPENAI_API_KEY) {
+    console.log('   ⚠️  OPENAI_API_KEY .env me nahi hai — AI Studio image nahi bana payega.');
+  } else {
+    try {
+      const OpenAI = require('openai');
+      const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+      client.models.list().catch(() => {});
+    } catch { /* ignore */ }
+  }
   console.log('');
 });

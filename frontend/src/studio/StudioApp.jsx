@@ -20,7 +20,7 @@ const EXAMPLES = [
   { icon: Wand2, title: "Create from text", text: "Luxury bedroom with warm wooden panelling, 2 images" },
 ];
 const QUALITY = [
-  { id: "low", label: "Fast (7-8s)", icon: Zap },
+  { id: "low", label: "Fast", icon: Zap },
   { id: "medium", label: "Balanced", icon: Gauge },
   { id: "high", label: "Best", icon: Sparkles },
 ];
@@ -51,16 +51,20 @@ function groupChats(chats) {
 }
 
 function Skeleton({ aspect }) {
-  const [sec, setSec] = useState(0);
+  const [elapsed, setElapsed] = useState(0);
   useEffect(() => {
     const start = Date.now();
-    const id = setInterval(() => setSec(Math.floor((Date.now() - start) / 1000)), 500);
+    const id = setInterval(() => setElapsed(Math.floor((Date.now() - start) / 1000)), 1000);
     return () => clearInterval(id);
   }, []);
+
   return (
     <div className="tile skeleton" style={{ aspectRatio: aspect }}>
       <div className="shimmer" />
-      <span className="skel-label"><span className="pulse-dot" /> {sec}s</span>
+      <span className="skel-label"><span className="pulse-dot" /> Generating design...</span>
+      {elapsed >= 60 && (
+        <span className="skel-hint">Photo edit me 1-3 minute lag sakte hain, wait karein</span>
+      )}
     </div>
   );
 }
@@ -86,6 +90,50 @@ export default function App() {
   const [listening, setListening] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [selected, setSelected] = useState(null); // "msgIndex-imgIndex" of the chosen image
+  const [ignoreContext, setIgnoreContext] = useState(false);
+
+  const ctx = useMemo(() => {
+    // If a result tile is selected (the tick), use only that image's url.
+    if (selected) {
+      const [mIdx, itmIdx] = selected.split("-").map(Number);
+      const msg = messages[mIdx];
+      const item = msg?.items?.[itmIdx];
+      if (typeof item === "string") {
+        return [{ url: item, aspect: msg.aspect || 1 }];
+      }
+    }
+
+    // Else take the latest assistant message that has images.
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (msg.role === "assistant" && Array.isArray(msg.items) && msg.items.length > 0) {
+        const hasSuccess = msg.items.some((it) => typeof it === "string");
+        if (!hasSuccess) continue;
+
+        const prevUser = messages[i - 1];
+        const prevPhotos = Array.isArray(prevUser?.photoUrls) && prevUser.photoUrls.length > 0
+          ? prevUser.photoUrls
+          : (prevUser?.photoUrl ? [prevUser.photoUrl] : []);
+
+        const photoCount = msg.photoCount || (prevPhotos.length > 0 ? prevPhotos.length : 1);
+        const perPhoto = msg.perPhoto || Math.max(1, Math.floor(msg.items.length / Math.max(1, photoCount)));
+        const countToExamine = Math.min(Math.max(1, photoCount), 4);
+
+        const list = [];
+        for (let p = 0; p < countToExamine; p++) {
+          const slice = msg.items.slice(p * perPhoto, (p + 1) * perPhoto);
+          const firstSuccess = slice.find((it) => typeof it === "string");
+          if (firstSuccess) {
+            list.push({ url: firstSuccess, aspect: msg.aspect || 1 });
+          }
+        }
+        if (list.length > 0) {
+          return list.slice(0, 4);
+        }
+      }
+    }
+    return [];
+  }, [selected, messages]);
 
   const fileRef = useRef(null);
   const scrollRef = useRef(null);
@@ -348,11 +396,13 @@ export default function App() {
     clearPending();
     setInput("");
     setSidebarOpen(false);
+    setIgnoreContext(false);
   }
 
   async function openChat(id) {
     setSelected(null);
     setSidebarOpen(false);
+    setIgnoreContext(false);
     if (id === activeId) return;
     try {
       const d = await api(`/api/studio/chats/${id}`);
@@ -472,7 +522,13 @@ export default function App() {
                   }
                 : m
             );
-            patchAsst((m) => ({ ...m, items: Array(ev.count).fill(null), transparent: ev.transparent }));
+            patchAsst((m) => ({
+              ...m,
+              items: Array(ev.count).fill(null),
+              transparent: ev.transparent,
+              perPhoto: ev.perPhoto,
+              photoCount: ev.photoCount,
+            }));
           } else if (ev.type === "image") {
             patchAsst((m) => ({ ...m, items: m.items.map((it, i) => (i === ev.index ? ev.url : it)) }));
           } else if (ev.type === "error") {
@@ -502,12 +558,40 @@ export default function App() {
     }
   }
 
-  function handleSend() {
+  async function handleSend() {
     const prompt = input.trim();
     if (!prompt) return setError("Pehle likhein ki aapko kya chahiye.");
-    const photosToSend = pending;
+
+    let photosToSend = pending;
+    if (photosToSend.length === 0 && ctx.length > 0 && !ignoreContext) {
+      try {
+        const downloaded = await Promise.all(
+          ctx.map(async (c, idx) => {
+            const blob = await fetchBlob(c.url);
+            const ext = blob.type.includes("png") || c.url.endsWith(".png") ? "png" : "jpg";
+            const rawFile = new File([blob], `previous-${idx + 1}.${ext}`, {
+              type: blob.type || (ext === "png" ? "image/png" : "image/jpeg"),
+            });
+            const { file: prepFile, aspect } = await prepareImage(rawFile);
+            const resolved = prepFile || rawFile;
+            return {
+              id: crypto.randomUUID(),
+              file: resolved,
+              aspect: aspect || c.aspect || 1,
+              preview: URL.createObjectURL(resolved),
+            };
+          })
+        );
+        photosToSend = downloaded;
+      } catch {
+        showToast("Pichli image download nahi ho payi");
+        return;
+      }
+    }
+
     setInput("");
     setPending([]);
+    setIgnoreContext(false);
     if (fileRef.current) fileRef.current.value = "";
     runGenerate(prompt, photosToSend);
   }
@@ -721,7 +805,9 @@ export default function App() {
                             const prevPhotos = Array.isArray(prevUser?.photoUrls) && prevUser.photoUrls.length > 0
                               ? prevUser.photoUrls
                               : (prevUser?.photoUrl ? [prevUser.photoUrl] : []);
-                            const before = prevPhotos.length > 0 ? prevPhotos[idx % prevPhotos.length] : "";
+                            const pCount = m.photoCount || prevPhotos.length || 0;
+                            const pIdx = m.perPhoto ? Math.floor(idx / m.perPhoto) : (idx % (prevPhotos.length || 1));
+                            const before = prevPhotos.length > 0 ? prevPhotos[pIdx % prevPhotos.length] : "";
                             const name = `prisha-${i}-${idx + 1}`;
                             return it === null ? (
                               <Skeleton key={idx} aspect={m.aspect || 1} />
@@ -743,7 +829,11 @@ export default function App() {
                                   <button onClick={() => handleUseAsInput(it)} title="Is image ko edit karein"><Pencil size={14} /></button>
                                   <button onClick={() => downloadImage(it, `${name}.${m.transparent ? "png" : "jpg"}`)} title="Download"><Download size={14} /></button>
                                 </div>
-                                {m.items.length > 1 && <span className="tile-tag">#{idx + 1}</span>}
+                                {m.items.length > 1 && (
+                                  <span className="tile-tag">
+                                    {pCount > 1 ? `Photo ${pIdx + 1}` : `#${idx + 1}`}
+                                  </span>
+                                )}
                                 {selected === `${i}-${idx}` && (
                                   <button className="tile-price" onClick={() => openCalculator(it)}>
                                     <IndianRupee size={15} /> Get price estimate
@@ -818,11 +908,41 @@ export default function App() {
                 </div>
               )}
 
+              {pending.length === 0 && ctx.length > 0 && (
+                !ignoreContext ? (
+                  <div className="ctx-row">
+                    <div className="ctx-thumbs">
+                      {ctx.map((c, idx) => (
+                        <img key={idx} src={absUrl(c.url)} alt={`Context ${idx + 1}`} />
+                      ))}
+                    </div>
+                    <span className="ctx-text">
+                      {ctx.length === 1 ? "Is image par hi kaam hoga (pichla result)" : `Ye ${ctx.length} images par kaam hoga`}
+                    </span>
+                    <button type="button" className="ctx-btn" onClick={() => setIgnoreContext(true)}>
+                      Naya banao
+                    </button>
+                  </div>
+                ) : (
+                  <div className="ctx-row">
+                    <button type="button" className="ctx-btn" onClick={() => setIgnoreContext(false)}>
+                      ↩ Pichli image par edit karo
+                    </button>
+                  </div>
+                )
+              )}
+
               <textarea
                 ref={taRef}
                 rows={1}
                 value={input}
-                placeholder={pending.length > 0 ? "Kya badalna hai? (remove background / wall green / 3 images)" : "Photo add karein ya seedha describe karein…"}
+                placeholder={
+                  pending.length > 0
+                    ? "Kya badalna hai? (remove background / wall green / 3 images)"
+                    : ctx.length > 0 && !ignoreContext
+                    ? "Is image me aur kya badalna hai?"
+                    : "Photo add karein ya seedha describe karein…"
+                }
                 onChange={(e) => setInput(e.target.value)}
                 onPaste={onPaste}
                 onKeyDown={(e) => {
